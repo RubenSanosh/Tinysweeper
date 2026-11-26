@@ -96,7 +96,7 @@ def main(max_frames=None):
     obs, _ = env.reset()
 
     games, wins = 0, 0
-    step_cooldown = 0  # Pace clicks slightly so moves are readable at 30 FPS.
+    step_cooldown = 0  # Pace clicks so moves are readable at 30 FPS.
     pause_frames = 0
     frames = 0
     running = True

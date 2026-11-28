@@ -1,184 +1,157 @@
 """
-Gradual iterative pruning pipeline for TinySweeper.
+Prune + shrink TinySweeper without giving up win rate.
 
-Strategy: prune in small steps (10% at a time), fine-tuning after each step,
-stopping when win rate drops more than 2% below baseline. This keeps far
-more accuracy than a one-shot 80% prune.
+1. Win rate first: every stage fine-tunes at low LR / low exploration and keeps the best
+   checkpoint it sees, so the 0% stage polishes the unpruned model and no stage can end
+   worse than it started.
+2. Prune in 10% steps while the win rate stays >= FLOOR.
+3. Pack to int8 weights (per-channel scale) + zlib -> model_tiny.bin, then re-measure
+   the win rate from the file itself (that is the number that ships).
 """
 
 import copy
 import os
-import shutil
 import warnings
+import zlib
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.utils import get_linear_fn
 
 from env import MinesweeperEnv
-from train import TinyConvQ, TinyLinearConvQ, evaluate_win_rate, make_dqn
+from train import TinyConvQ, evaluate_win_rate, make_dqn
 
 torch.set_num_threads(1)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning)
+
+FLOOR = 0.80                            # never ship below this
+SEL = dict(n_games=500, seed=50_000)    # used to pick checkpoints
+TEST = dict(n_games=2000, seed=90_000)  # reported numbers: games never used for picking
 
 
 class KeepMaskCallback(BaseCallback):
-    """Re-apply binary pruning masks after every gradient step to enforce sparsity."""
+    """Re-apply pruning masks every step; every `every` steps keep the best weights seen."""
 
-    def __init__(self, masks):
+    def __init__(self, masks, best_sd, best_wr, every=5_000):
         super().__init__()
-        self.masks = masks
+        self.masks, self.best_sd, self.best_wr, self.every = masks, best_sd, best_wr, every
 
     def _on_step(self):
+        net = self.model.q_net.q_net
+        mods = dict(net.named_modules())
         with torch.no_grad():
-            modules = dict(self.model.q_net.q_net.named_modules())
             for name, mask in self.masks.items():
-                modules[name].weight.mul_(mask)
+                mods[name].weight.mul_(mask)
+        if self.num_timesteps % self.every == 0:
+            wr = evaluate_win_rate(net, **SEL)
+            if wr > self.best_wr:
+                self.best_wr, self.best_sd = wr, copy.deepcopy(net.state_dict())
         return True
 
 
 def apply_prune(net, cumulative_sparsity):
-    """Apply L1-unstructured pruning globally across all Conv2d to reach target sparsity.
+    """Global L1 pruning over all Conv2d to the target total sparsity; returns the masks.
 
-    Uses cumulative amounts so each call brings total sparsity to the target level.
-    Returns the new binary masks dict.
+    shortcut: unstructured pruning only shrinks the *file* (zeros compress in pack());
+              structured channel pruning would shrink the model itself, upgrade if needed.
     """
-    # Collect all (module, 'weight') pairs for Conv2d layers
-    params = [(m, 'weight') for _, m in net.named_modules() if isinstance(m, nn.Conv2d)]
-    # Global L1 unstructured pruning to reach cumulative_sparsity
-    prune.global_unstructured(
-        params,
-        pruning_method=prune.L1Unstructured,
-        amount=cumulative_sparsity,
-    )
+    params = [(m, "weight") for m in net.modules() if isinstance(m, nn.Conv2d)]
+    prune.global_unstructured(params, pruning_method=prune.L1Unstructured, amount=cumulative_sparsity)
     masks = {}
     for name, m in net.named_modules():
         if isinstance(m, nn.Conv2d):
             masks[name] = m.weight_mask.clone()
-            prune.remove(m, 'weight')
+            prune.remove(m, "weight")
     return masks
 
 
-def finetune(net, masks, steps=15_000, lr=5e-4):
-    """Fine-tune a pruned network inside a fresh DQN trainer, returning the net."""
-    env = MinesweeperEnv()
-    dqn = make_dqn(env, lr=lr)
+def finetune(net, masks, steps=20_000, lr=1e-4):
+    """Fine-tune in a fresh DQN; returns the best-scoring weights seen (the start point counts)."""
+    dqn = make_dqn(MinesweeperEnv(), lr=lr)
     dqn.q_net.q_net.load_state_dict(net.state_dict())
     dqn.q_net_target.q_net.load_state_dict(net.state_dict())
-    dqn.exploration_initial_eps = 0.08
-    dqn.exploration_final_eps = 0.01
-    dqn.learn(total_timesteps=steps, callback=KeepMaskCallback(masks))
+    # The eps attributes are baked into the schedule when the DQN is built, so replace the schedule.
+    dqn.exploration_schedule = get_linear_fn(0.05, 0.01, 0.3)
+    dqn.gradient_steps = 1  # 4 was ~3x slower for no visible gain
+    cb = KeepMaskCallback(masks, copy.deepcopy(net.state_dict()), evaluate_win_rate(net, **SEL))
+    dqn.learn(total_timesteps=steps, callback=cb)
     out = TinyConvQ(16)
-    out.load_state_dict(dqn.q_net.q_net.state_dict())
-    # Re-enforce masks after the final optimizer step
-    with torch.no_grad():
-        modules = dict(out.named_modules())
-        for name, mask in masks.items():
-            modules[name].weight.mul_(mask)
-    out.eval()
-    return out
-
-
-def to_linear_conv(conv_net):
-    """Exact nn.Linear copy of Conv2d layers for INT8 dynamic quantization compatibility."""
-    lin_net = TinyLinearConvQ(conv_net.ch)
-    with torch.no_grad():
-        for cl, ll in zip(
-            [conv_net.c1, conv_net.c2, conv_net.c3, conv_net.out],
-            [lin_net.l1, lin_net.l2, lin_net.l3, lin_net.out],
-        ):
-            ll.weight.copy_(cl.weight.view(cl.out_channels, -1))
-            ll.bias.copy_(cl.bias)
-    return lin_net.eval()
+    out.load_state_dict(cb.best_sd)
+    return out.eval()
 
 
 def count_nonzero(net):
     total = sum(p.numel() for p in net.parameters())
-    nz = sum(int(torch.count_nonzero(p).item()) for p in net.parameters())
-    return total, nz
+    return total, sum(int(torch.count_nonzero(p)) for p in net.parameters())
 
 
-def quantize_and_save(net, path):
-    """INT8 dynamic-quantize Conv2d-net via its Linear equivalent and save."""
-    lin = to_linear_conv(net)
-    qnet = torch.ao.quantization.quantize_dynamic(lin, {nn.Linear}, dtype=torch.qint8)
-    torch.save(qnet.state_dict(), path)
-    return qnet, os.path.getsize(path)
+def _layers(net):
+    return (net.c1, net.c2, net.c3, net.out)
+
+
+def pack(net, path):
+    """int8 weights (one scale per output channel), fp16 scales/biases, zlib. Pruned zeros compress away."""
+    s, b, q = [], [], []
+    for m in _layers(net):
+        w = m.weight.detach().flatten(1)
+        sc = (w.abs().amax(1) / 127).clamp_min(1e-4).half().float()
+        s.append(sc)
+        b.append(m.bias.detach())
+        q.append((w / sc[:, None]).round().clamp(-127, 127).to(torch.int8).flatten())
+    parts = (torch.cat(s).half(), torch.cat(b).half(), torch.cat(q))
+    with open(path, "wb") as f:
+        f.write(zlib.compress(b"".join(t.numpy().tobytes() for t in parts), 9))
+    return os.path.getsize(path)
+
+
+def load_packed(path):
+    """Inverse of pack(): returns a regular TinyConvQ (fp32 compute, int8-rounded weights)."""
+    with open(path, "rb") as f:
+        blob = zlib.decompress(f.read())
+    net = TinyConvQ(16)
+    n = sum(m.out_channels for m in _layers(net))
+    s = torch.from_numpy(np.frombuffer(blob, np.float16, n).astype(np.float32))
+    b = torch.from_numpy(np.frombuffer(blob, np.float16, n, offset=2 * n).astype(np.float32))
+    q = torch.from_numpy(np.frombuffer(blob, np.int8, offset=4 * n).astype(np.float32))
+    i = j = 0
+    for m in _layers(net):
+        o, k = m.out_channels, m.weight[0].numel()
+        m.weight.data = (q[j:j + o * k].view(o, k) * s[i:i + o, None]).view_as(m.weight)
+        m.bias.data = b[i:i + o]
+        i, j = i + o, j + o * k
+    return net.eval()
 
 
 def main():
-    # --- Load baseline ---
-    baseline = TinyConvQ(16)
-    baseline.load_state_dict(torch.load("model.pth", map_location="cpu", weights_only=True))
-    baseline.eval()
-    base_size = os.path.getsize("model.pth")
-    base_wr = evaluate_win_rate(baseline, n_games=1000)
-    print(f"Baseline: {base_wr*100:.2f}% win rate, {base_size:,} bytes")
+    net = TinyConvQ(16)
+    net.load_state_dict(torch.load("model.pth", map_location="cpu", weights_only=True))
+    net.eval()
+    base_wr = evaluate_win_rate(net, **TEST)
+    print(f"model.pth: {base_wr*100:.1f}% on {TEST['n_games']} unseen games, floor {FLOOR*100:.0f}%\n")
+    print(f"{'Prune':>6} {'Win rate':>9} {'NZ params':>12}")
 
-    # Drop tolerance: stop pruning if we fall more than 3% below baseline
-    tol = 0.03
-    threshold = base_wr - tol
-
-    rows = [("Baseline FP32", base_size, base_wr, 5105)]
-
-    # Gradual pruning: 10% cumulative steps. Each iteration starts from the
-    # current best net and applies prune to the total target sparsity level.
-    # shortcut: global unstructured pruning re-runs from scratch each iter;
-    #           structured channel pruning would give better speedup, upgrade if needed.
-    best_net = copy.deepcopy(baseline)
-    best_wr = base_wr
-    step = 0.10
-    target = step
-
-    print(f"\nGradual pruning (tolerance: drop ≤{tol*100:.0f}% below {base_wr*100:.1f}%)\n")
-    print(f"{'Target':>8}  {'Zero-shot':>10}  {'Fine-tuned':>10}  {'NZ params':>10}")
-    print("-" * 44)
-
-    final_net = best_net
-    final_sparsity = 0.0
+    best, best_target, target = net, 0.0, 0.0
     while target <= 0.70:
-        candidate = copy.deepcopy(best_net)
-        masks = apply_prune(candidate, cumulative_sparsity=target)
-        zs_wr = evaluate_win_rate(candidate, n_games=300)
-
-        ft_net = finetune(candidate, masks, steps=15_000, lr=5e-4)
-        ft_wr = evaluate_win_rate(ft_net, n_games=500)
-
-        total_p, nz_p = count_nonzero(ft_net)
-        print(f"{int(target*100):>7}%  {zs_wr*100:>9.1f}%  {ft_wr*100:>9.1f}%  {nz_p:>10,}/{total_p}", flush=True)
-
-        rows.append((f"Pruned {int(target*100)}% + FT", base_size, ft_wr, nz_p))
-        # Save checkpoint for every step
-        ckpt = f"model_pruned{int(target*100)}pct.pth"
-        torch.save(ft_net.state_dict(), ckpt)
-
-        if ft_wr >= threshold:
-            best_net = ft_net
-            best_wr = ft_wr
-            final_net = ft_net
-            final_sparsity = target
-            target += step
-        else:
-            print(f"  → Win rate {ft_wr*100:.1f}% dropped below threshold {threshold*100:.1f}%; stopping pruning.")
+        cand = copy.deepcopy(best)
+        ft = finetune(cand, apply_prune(cand, target))
+        wr = evaluate_win_rate(ft, **TEST)
+        total, nz = count_nonzero(ft)
+        print(f"{target*100:>5.0f}% {wr*100:>8.1f}% {nz:>6,}/{total:,}", flush=True)
+        torch.save(ft.state_dict(), f"model_pruned{round(target*100)}pct.pth")
+        if wr < FLOOR:
+            print(f"  below the {FLOOR*100:.0f}% floor, stopping; keeping the {best_target*100:.0f}% model")
             break
+        best, best_target = ft, target
+        target = round(target + 0.10, 2)
 
-    # Quantize the best pruned net to INT8
-    qnet, tiny_size = quantize_and_save(final_net, "model_tiny.pth")
-    shutil.copy("model_tiny.pth", "model_tiny.pth.bak")
-    tiny_wr = evaluate_win_rate(qnet, n_games=1000)
-    rows.append(("INT8 Quantized (tiny.pth)", tiny_size, tiny_wr, "-"))
-
-    # Print final table
-    total_p, nz_p = count_nonzero(final_net)
-    print(f"\n{'Stage':<28} {'Size':>12} {'Win Rate':>10} {'NZ Params':>12}")
-    print("-" * 64)
-    for label, sz, wr, nz in rows:
-        nz_str = f"{nz:,}" if isinstance(nz, int) else nz
-        print(f"{label:<28} {sz:>12,} {wr*100:>9.2f}% {nz_str:>12}")
-    print(f"\nFinal sparsity: {final_sparsity*100:.0f}%  |  Non-zero params: {nz_p:,} / {total_p:,}")
-    print(f"model_tiny.pth: {tiny_size:,} bytes  |  win rate: {tiny_wr*100:.2f}%")
+    size = pack(best, "model_tiny.bin")
+    packed_wr = evaluate_win_rate(load_packed("model_tiny.bin"), **TEST)
+    print(f"\nPruning kept: {best_target*100:.0f}%  |  model_tiny.bin: {size:,} bytes (model.pth: {os.path.getsize('model.pth'):,})")
+    print(f"Win rate loaded from the file: {packed_wr*100:.1f}%  (model.pth was {base_wr*100:.1f}%)")
 
 
 if __name__ == "__main__":

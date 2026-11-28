@@ -3,6 +3,9 @@
 **80.2% win rate** packed into **4,716 bytes (~4.6 KB)** a **5,105-parameter** convolutional Q-network 
 playing 6x6 Minesweeper (4 mines), landing within **12.3 percentage points** of the **~92.5% near-optimal 
 solver ceiling** across random first clicks *(100% is impossible due to unavoidable guess boards)*
+
+![TinySweeper demo](tinysweeper.gif)
+
 ## Results
 
 | Model | File | Size | Parameters | Win rate |

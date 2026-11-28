@@ -1,49 +1,33 @@
 # TinySweeper
 
-A tiny neural network that plays 6x6 Minesweeper (4 mines) with an **83.2% win rate** in about **23 KB** (5,105 parameters).
+A tiny convolutional Q-network that plays 6x6 Minesweeper (4 mines) with an **80.2% win rate** packed into **4,716 bytes** (~4.6 KB, 5,105 parameters).
 
 ## Results
 
 | Model | File | Size | Parameters | Win rate |
 |---|---|---|---|---|
-| Full precision (FP32) | `model.pth` | 23 KB | 5,105 | 83.2% |
+| Packed INT8 + zlib (main) | `model_tiny.bin` | 4,716 bytes (~4.6 KB) | 5,105 | 80.2% |
+| Full precision (FP32 baseline) | `model.pth` | 23,473 bytes (~22.9 KB) | 5,105 | 80.8% (83.2% on 500 games) |
 
-Win rate was measured over 500 games on fixed seeds, with the first click always safe. Results on a few hundred games are noisy (about ±2%), so treat the number as approximate.
+The packed model (`model_tiny.bin`) is evaluated on 2,000 held-out games with the first click always safe. Earlier 500-game scores have roughly ±2% evaluation noise.
 
-## Failed experiment: INT8 quantization
+## Failed experiment: dynamic INT8 quantization
 
-I also tried compressing the model with pruning and INT8 dynamic quantization (`compress.py`). The file shrank to about 11 KB, but the win rate dropped to **38.5%**, which is far too much accuracy loss. It is **not** part of the main model, and is kept only as a record of what did not work.
-
-| Model | File | Size | Win rate |
-|---|---|---|---|
-| INT8 quantized (failed experiment) | `model_tiny.pth` | ~11 KB | 38.5% |
+An earlier attempt using pruning and dynamic INT8 quantization shrank the model to about 11 KB, but win rate dropped to **38.5%** (likely due to dynamic activation quantization). That approach was replaced by INT8 weight packing with zlib compression in `compress.py` and is not used by the main model.
 
 ## How it works
 
-- **Environment** (`env.py`): a Gymnasium 6x6 Minesweeper with 4 mines. Mines are placed after the first click, so the first move can never lose.
-- **Model** (`train.py`): a 3-layer, 16-channel 3x3 convolutional Q-network. Convolutions share weights across the board, which is how ~5K parameters can reason about neighbouring mine counts.
-- **Training**: DQN (Stable-Baselines3) with action masking, so the agent never clicks an already revealed cell.
+- **Environment** (`env.py`): a Gymnasium 6x6 Minesweeper environment with 4 mines. Mines are placed after the first click, so the first move is always safe.
+- **Model** (`train.py`): a tiny convolutional Q-network (TinyConvQ) with three 3x3 convolutional layers (16 channels) and a 1x1 output layer (5,105 parameters total). Weight sharing across spatial positions lets a small parameter budget reason over local mine counts.
+- **Training**: DQN (Stable-Baselines3) with action masking so the agent never picks an already revealed cell.
+- **Compression** (`compress.py`): fine-tunes with an 80% win-rate floor across pruning steps, then packs INT8 weights with zlib into `model_tiny.bin` and loads them via `load_packed()`.
 
 ## Run it
 
 ```bash
 python -m venv venv
 source venv/bin/activate        # fish: source venv/bin/activate.fish
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch --index-url [https://download.pytorch.org/whl/cpu](https://download.pytorch.org/whl/cpu)
 pip install -r requirements.txt
 
-python demo_fp32.py             # watch the main (FP32) model play
-```
-
-## Train it yourself
-
-```bash
-python train.py                 # train from scratch (400k steps), writes model.pth
-python continue_train.py        # keep training from model.pth, saves only improvements
-```
-
-Experimental compression (see the failed experiment above): `python compress.py`, then `python demo.py`.
-
-## Notes
-
-- Minesweeper sometimes forces a guess, so no player can win every game.
+python demo.py                  # watch the packed model (model_tiny.bin) play
